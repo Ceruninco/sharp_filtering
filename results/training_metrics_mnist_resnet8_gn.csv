@@ -1,0 +1,2 @@
+dataset,epoch,batch_size,accuracy,compression_rate,debias,remove_dom,seed,nb_dims_pca,arch,disable_dp,sigma,max_per_sample_grad_norm
+mnist,1,256,0.8946,1,True,False,5,200,ResNet8GN_w16_g8,False,1.0,1.0
