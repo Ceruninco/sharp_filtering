@@ -2,33 +2,12 @@
 """
 Launcher: DP training with AdamCorr + ResNet-8 (Opacus-compatible) + GroupNorm.
 
-Refactor summary (requested):
-- Training loss is logged to a dataset-specific CSV from DATASET_CONFIG.
-- Gradient-subspace fractions are logged to a dataset-specific CSV from DATASET_CONFIG,
-  with full run metadata (dataset/arch/seed/remove_dom/etc.) and injected into the optimizer
-  via optimizer.set_logging(...).
-- Accuracy metrics are logged as before to default_csv (or --csv-filename override).
-- All CSV rows explicitly include remove_dom, arch, seed, etc.
+Jean-Zay dataset paths:
+  - MNIST: /lustre/fsmisc/dataset/MNIST
+    (contains raw/ and processed/ with training.pt and test.pt)
+  - TinyImageNet: /lustre/fsmisc/dataset/tiny-imagenet/raw_dataset/
 
-Datasets:
-  - MNIST
-  - FashionMNIST
-  - CIFAR-10
-  - TinyImageNet
-
-TinyImageNet on JeanZay:
-  - Uses the shared ImageFolder-compatible dataset:
-      /lustre/fsmisc/dataset/tiny-imagenet/raw_dataset/
-    which contains:
-      train/<class>/*
-      val/<class>/*
-      test/<...> (unused)
-  - No downloading/unzipping/val-rewrite is performed.
-
-Notes:
-  - ResNet-8 is CIFAR-style and expects 3-channel input.
-    For MNIST/FashionMNIST, we replicate grayscale -> 3 channels.
-  - GroupNorm is used everywhere (no BatchNorm).
+This version modifies ONLY the MNIST path usage so that torchvision does NOT try to download.
 """
 
 import argparse
@@ -48,9 +27,10 @@ from tqdm import tqdm
 from opacus_local.optimizers.DOME_optim import AdamCorr
 
 # ------------------------------------------------------------------------
-# TinyImageNet shared dataset location (JeanZay)
+# Shared dataset locations (JeanZay)
 # ------------------------------------------------------------------------
 
+MNIST_SHARED_ROOT = "/lustre/fsmisc/dataset/MNIST"
 TINYIMAGENET_SHARED_ROOT = "/lustre/fsmisc/dataset/tiny-imagenet/raw_dataset"
 
 # ------------------------------------------------------------------------
@@ -80,7 +60,8 @@ DATASET_CONFIG = {
         "default_loss_csv": "../results/training_loss_mnist_resnet8_gn.csv",
         "default_fractions_csv": "../results/gradient_fractions_mnist_resnet8_gn.csv",
         "default_dtype": torch.float32,
-        "default_data_root": "../mnist",
+        # IMPORTANT: JeanZay shared MNIST root (has raw/ and processed/)
+        "default_data_root": MNIST_SHARED_ROOT,
         "sketched": {"seeds": [5, 6, 7]},
         "debias_sketched": True,
     },
@@ -110,7 +91,6 @@ DATASET_CONFIG = {
         "default_loss_csv": "../results/training_loss_tinyimagenet_resnet8_gn.csv",
         "default_fractions_csv": "../results/gradient_fractions_tinyimagenet_resnet8_gn.csv",
         "default_dtype": torch.float32,
-        # kept for symmetry; we do NOT use a CLI flag for TinyImageNet anymore
         "default_data_root": TINYIMAGENET_SHARED_ROOT,
         "sketched": {"seeds": [2, 3, 4, 5, 6]},
         "debias_sketched": True,
@@ -154,14 +134,7 @@ def _append_row_csv(csv_path: str, fieldnames: List[str], row: Dict) -> None:
         writer.writerow(row)
 
 
-def log_training_loss(
-    *,
-    csv_path: str,
-    run_meta: Dict,
-    epoch: int,
-    step: int,
-    loss: float,
-) -> None:
+def log_training_loss(*, csv_path: str, run_meta: Dict, epoch: int, step: int, loss: float) -> None:
     row = dict(run_meta)
     row.update({"epoch": int(epoch), "step": int(step), "loss": float(loss)})
     _append_row_csv(csv_path, LOSS_FIELDS, row)
@@ -211,30 +184,19 @@ class BasicBlockGN(nn.Module):
 
     def forward(self, x):
         identity = x
-
         out = self.conv1(x)
         out = self.gn1(out)
         out = self.relu(out)
-
         out = self.conv2(out)
         out = self.gn2(out)
-
         if self.downsample is not None:
             identity = self.downsample(x)
-
         out = out + identity
         out = self.relu(out)
         return out
 
 
 class ResNet8GN(nn.Module):
-    """
-    CIFAR-style ResNet-8 with GroupNorm:
-      stem: 3x3 conv + GN
-      stages: [1,1,1] basic blocks with strides [1,2,2]
-      head: global avg pool + linear
-    """
-
     def __init__(self, num_classes: int = 10, width: int = 16, gn_groups: int = 8):
         super().__init__()
         self.in_planes = width
@@ -266,11 +228,9 @@ class ResNet8GN(nn.Module):
         x = self.conv1(x)
         x = self.gn1(x)
         x = self.relu(x)
-
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.fc(x)
@@ -281,38 +241,20 @@ class ResNet8GN(nn.Module):
 # Training / eval
 # ------------------------------------------------------------------------
 
-def train_one_epoch(
-    *,
-    model,
-    device,
-    train_loader,
-    optimizer,
-    epoch: int,
-    loss_csv_path: str,
-    run_meta: Dict,
-):
+def train_one_epoch(*, model, device, train_loader, optimizer, epoch: int, loss_csv_path: str, run_meta: Dict):
     model.train()
     criterion = nn.CrossEntropyLoss()
-
     start_step = (epoch - 1) * len(train_loader)
 
     for batch_idx, (data, target) in enumerate(tqdm(train_loader)):
         step = start_step + batch_idx
         data, target = data.to(device), target.to(device)
-
         optimizer.zero_grad(set_to_none=True)
         output = model(data)
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
-
-        log_training_loss(
-            csv_path=loss_csv_path,
-            run_meta=run_meta,
-            epoch=epoch,
-            step=step,
-            loss=loss.item(),
-        )
+        log_training_loss(csv_path=loss_csv_path, run_meta=run_meta, epoch=epoch, step=step, loss=loss.item())
 
 
 @torch.no_grad()
@@ -356,8 +298,21 @@ def _assert_tinyimagenet_shared_layout(root: str) -> None:
     val_dir = os.path.join(root, "val")
     if not (os.path.isdir(train_dir) and os.path.isdir(val_dir)):
         raise FileNotFoundError(
-            f"TinyImageNet shared dataset not found or incomplete at: {root}\n"
-            f"Expected: {train_dir} and {val_dir}"
+            f"TinyImageNet shared dataset not found or incomplete at: {root}\nExpected: {train_dir} and {val_dir}"
+        )
+
+
+def _assert_mnist_shared_layout(root: str) -> None:
+    # torchvision MNIST expects <root>/raw/* and <root>/processed/*
+    proc = os.path.join(root, "processed")
+    raw = os.path.join(root, "raw")
+    if not (os.path.isdir(proc) and os.path.isdir(raw)):
+        raise FileNotFoundError(
+            f"MNIST shared dataset not found or incomplete at: {root}\nExpected: {raw} and {proc}"
+        )
+    if not (os.path.isfile(os.path.join(proc, "training.pt")) and os.path.isfile(os.path.join(proc, "test.pt"))):
+        raise FileNotFoundError(
+            f"MNIST processed files missing under {proc}. Expected training.pt and test.pt"
         )
 
 
@@ -365,72 +320,85 @@ def build_dataloaders(args):
     ds = args.dataset.lower()
 
     if ds == "mnist":
-        train_transform = transforms.Compose([
-            transforms.Resize(32),
-            transforms.Grayscale(num_output_channels=3),
-            transforms.ToTensor(),
-            transforms.Normalize((MNIST_MEAN,) * 3, (MNIST_STD,) * 3),
-        ])
-        test_transform = transforms.Compose([
-            transforms.Resize(32),
-            transforms.Grayscale(num_output_channels=3),
-            transforms.ToTensor(),
-            transforms.Normalize((MNIST_MEAN,) * 3, (MNIST_STD,) * 3),
-        ])
-        train_dataset = datasets.MNIST(DATASET_CONFIG["mnist"]["default_data_root"], train=True, download=True,
-                                       transform=train_transform)
-        test_dataset = datasets.MNIST(DATASET_CONFIG["mnist"]["default_data_root"], train=False, download=True,
-                                      transform=test_transform)
+        mnist_root = DATASET_CONFIG["mnist"]["default_data_root"]
+        _assert_mnist_shared_layout(mnist_root)
+
+        train_transform = transforms.Compose(
+            [
+                transforms.Resize(32),
+                transforms.Grayscale(num_output_channels=3),
+                transforms.ToTensor(),
+                transforms.Normalize((MNIST_MEAN,) * 3, (MNIST_STD,) * 3),
+            ]
+        )
+        test_transform = transforms.Compose(
+            [
+                transforms.Resize(32),
+                transforms.Grayscale(num_output_channels=3),
+                transforms.ToTensor(),
+                transforms.Normalize((MNIST_MEAN,) * 3, (MNIST_STD,) * 3),
+            ]
+        )
+
+        # IMPORTANT: download=False so it uses the shared files (no network on compute nodes)
+        train_dataset = datasets.MNIST(mnist_root, train=True, download=False, transform=train_transform)
+        test_dataset = datasets.MNIST(mnist_root, train=False, download=False, transform=test_transform)
 
     elif ds == "fashionmnist":
-        train_transform = transforms.Compose([
-            transforms.Resize(32),
-            transforms.Grayscale(num_output_channels=3),
-            transforms.ToTensor(),
-            transforms.Normalize((FASHION_MNIST_MEAN,) * 3, (FASHION_MNIST_STD,) * 3),
-        ])
-        test_transform = transforms.Compose([
-            transforms.Resize(32),
-            transforms.Grayscale(num_output_channels=3),
-            transforms.ToTensor(),
-            transforms.Normalize((FASHION_MNIST_MEAN,) * 3, (FASHION_MNIST_STD,) * 3),
-        ])
-        train_dataset = datasets.FashionMNIST(DATASET_CONFIG["fashionmnist"]["default_data_root"], train=True,
-                                             download=True, transform=train_transform)
-        test_dataset = datasets.FashionMNIST(DATASET_CONFIG["fashionmnist"]["default_data_root"], train=False,
-                                            download=True, transform=test_transform)
+        train_transform = transforms.Compose(
+            [
+                transforms.Resize(32),
+                transforms.Grayscale(num_output_channels=3),
+                transforms.ToTensor(),
+                transforms.Normalize((FASHION_MNIST_MEAN,) * 3, (FASHION_MNIST_STD,) * 3),
+            ]
+        )
+        test_transform = transforms.Compose(
+            [
+                transforms.Resize(32),
+                transforms.Grayscale(num_output_channels=3),
+                transforms.ToTensor(),
+                transforms.Normalize((FASHION_MNIST_MEAN,) * 3, (FASHION_MNIST_STD,) * 3),
+            ]
+        )
+        train_dataset = datasets.FashionMNIST(
+            DATASET_CONFIG["fashionmnist"]["default_data_root"], train=True, download=True, transform=train_transform
+        )
+        test_dataset = datasets.FashionMNIST(
+            DATASET_CONFIG["fashionmnist"]["default_data_root"], train=False, download=True, transform=test_transform
+        )
 
     elif ds == "cifar10":
-        train_transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-        ])
-        test_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-        ])
-        train_dataset = datasets.CIFAR10(root=DATASET_CONFIG["cifar10"]["default_data_root"], train=True, download=True,
-                                         transform=train_transform)
-        test_dataset = datasets.CIFAR10(root=DATASET_CONFIG["cifar10"]["default_data_root"], train=False, download=True,
-                                        transform=test_transform)
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+            ]
+        )
+        test_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD)])
+        train_dataset = datasets.CIFAR10(
+            root=DATASET_CONFIG["cifar10"]["default_data_root"], train=True, download=True, transform=train_transform
+        )
+        test_dataset = datasets.CIFAR10(
+            root=DATASET_CONFIG["cifar10"]["default_data_root"], train=False, download=True, transform=test_transform
+        )
 
     elif ds == "tinyimagenet":
         _assert_tinyimagenet_shared_layout(TINYIMAGENET_SHARED_ROOT)
         train_dir = os.path.join(TINYIMAGENET_SHARED_ROOT, "train")
         val_dir = os.path.join(TINYIMAGENET_SHARED_ROOT, "val")
 
-        train_transform = transforms.Compose([
-            transforms.RandomCrop(64, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
-        test_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomCrop(64, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            ]
+        )
+        test_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 
         train_dataset = datasets.ImageFolder(root=train_dir, transform=train_transform)
         test_dataset = datasets.ImageFolder(root=val_dir, transform=test_transform)
@@ -477,11 +445,9 @@ def run_experiments(args, device, train_loader, test_loader):
 
         for remove_dom in [False, True]:
             try:
-                model = ResNet8GN(
-                    num_classes=num_classes,
-                    width=args.resnet_width,
-                    gn_groups=args.gn_groups,
-                ).to(device)
+                model = ResNet8GN(num_classes=num_classes, width=args.resnet_width, gn_groups=args.gn_groups).to(
+                    device
+                )
 
                 nb_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
                 arch_str = f"ResNet8GN_w{args.resnet_width}_g{args.gn_groups}"
@@ -524,7 +490,6 @@ def run_experiments(args, device, train_loader, test_loader):
                     enable_fraction_logging=not args.disable_fraction_logging,
                 )
 
-                privacy_engine = None
                 if not args.disable_dp:
                     privacy_engine = PrivacyEngine(secure_mode=args.secure_rng)
                     model, optimizer, train_loader_p = privacy_engine.make_private(
