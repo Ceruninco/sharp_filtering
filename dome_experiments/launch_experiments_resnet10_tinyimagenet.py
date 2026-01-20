@@ -14,28 +14,28 @@ Datasets:
   - MNIST
   - FashionMNIST
   - CIFAR-10
-  - TinyImageNet (tiny-imagenet-200)
+  - TinyImageNet
 
-TinyImageNet auto-download:
-  - Downloads the official CS231n zip if missing
-  - Unzips under --data-root
-  - Builds an ImageFolder-compatible validation folder automatically
+TinyImageNet on JeanZay:
+  - Uses the shared ImageFolder-compatible dataset:
+      /lustre/fsmisc/dataset/tiny-imagenet/raw_dataset/
+    which contains:
+      train/<class>/*
+      val/<class>/*
+      test/<...> (unused)
+  - No downloading/unzipping/val-rewrite is performed.
 
-Expected TinyImageNet layout after unzip:
-  <data_root>/tiny-imagenet-200/train/<wnid>/images/*.JPEG
-  <data_root>/tiny-imagenet-200/val/images/*.JPEG
-  <data_root>/tiny-imagenet-200/val/val_annotations.txt
+Notes:
+  - ResNet-8 is CIFAR-style and expects 3-channel input.
+    For MNIST/FashionMNIST, we replicate grayscale -> 3 channels.
+  - GroupNorm is used everywhere (no BatchNorm).
 """
 
 import argparse
-import hashlib
+import csv
 import os
 import random
-import shutil
-import urllib.request
-import zipfile
-import csv
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -47,6 +47,11 @@ from tqdm import tqdm
 
 from opacus_local.optimizers.DOME_optim import AdamCorr
 
+# ------------------------------------------------------------------------
+# TinyImageNet shared dataset location (JeanZay)
+# ------------------------------------------------------------------------
+
+TINYIMAGENET_SHARED_ROOT = "/lustre/fsmisc/dataset/tiny-imagenet/raw_dataset"
 
 # ------------------------------------------------------------------------
 # Dataset stats
@@ -63,101 +68,6 @@ CIFAR10_STD = (0.2470, 0.2435, 0.2616)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-# ------------------------------------------------------------------------
-# TinyImageNet auto-download
-# ------------------------------------------------------------------------
-
-TINYIMAGENET_URL = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
-TINYIMAGENET_MD5 = "90528d7ca1a48142e341f4ef8d21d0de"
-
-
-def _md5(path: str, chunk_size: int = 1024 * 1024) -> str:
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(chunk_size)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
-
-
-def download_and_prepare_tinyimagenet(data_root: str) -> str:
-    """
-    Ensures tiny-imagenet-200 is present under data_root (or data_root itself is that folder).
-    Downloads and unzips if missing.
-
-    Returns: path to tiny-imagenet-200 directory.
-    """
-    ti_root = data_root
-    if os.path.basename(os.path.normpath(ti_root)) != "tiny-imagenet-200":
-        ti_root = os.path.join(data_root, "tiny-imagenet-200", "tiny-imagenet-200")
-
-    if os.path.isdir(ti_root) and os.path.isdir(os.path.join(ti_root, "train")):
-        return ti_root
-
-    os.makedirs(data_root, exist_ok=True)
-    zip_path = os.path.join(data_root, "tiny-imagenet-200.zip")
-
-    if not os.path.isfile(zip_path):
-        print(f"[TinyImageNet] Downloading from {TINYIMAGENET_URL} -> {zip_path}")
-        urllib.request.urlretrieve(TINYIMAGENET_URL, zip_path)
-
-    md5 = _md5(zip_path)
-    if md5 != TINYIMAGENET_MD5:
-        raise RuntimeError(
-            f"[TinyImageNet] MD5 mismatch for {zip_path}: got {md5}, expected {TINYIMAGENET_MD5}. "
-            f"Delete the zip and retry."
-        )
-
-    print(f"[TinyImageNet] Unzipping {zip_path} -> {data_root}")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(data_root)
-
-    if not os.path.isdir(ti_root) or not os.path.isdir(os.path.join(ti_root, "train")):
-        raise RuntimeError(f"[TinyImageNet] Unzip finished but expected folder not found: {ti_root}")
-
-    return ti_root
-
-
-def prepare_tinyimagenet_val(val_dir: str, out_dir: str):
-    """
-    Create ImageFolder-compatible validation directory:
-      out_dir/<wnid>/*.JPEG
-    based on val_annotations.txt.
-    """
-    if os.path.isdir(out_dir) and len(os.listdir(out_dir)) > 0:
-        return
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    ann_path = os.path.join(val_dir, "val_annotations.txt")
-    images_dir = os.path.join(val_dir, "images")
-
-    if not os.path.isfile(ann_path):
-        raise FileNotFoundError(f"Missing TinyImageNet val annotations: {ann_path}")
-    if not os.path.isdir(images_dir):
-        raise FileNotFoundError(f"Missing TinyImageNet val images dir: {images_dir}")
-
-    mapping = {}
-    with open(ann_path, "r") as f:
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) >= 2:
-                mapping[parts[0]] = parts[1]
-
-    for img_name, wnid in mapping.items():
-        src = os.path.join(images_dir, img_name)
-        if not os.path.isfile(src):
-            continue
-        dst_dir = os.path.join(out_dir, wnid)
-        os.makedirs(dst_dir, exist_ok=True)
-        dst = os.path.join(dst_dir, img_name)
-        if not os.path.isfile(dst):
-            shutil.copy2(src, dst)
-
 
 # ------------------------------------------------------------------------
 # Dataset configuration
@@ -200,12 +110,12 @@ DATASET_CONFIG = {
         "default_loss_csv": "../results/training_loss_tinyimagenet_resnet8_gn.csv",
         "default_fractions_csv": "../results/gradient_fractions_tinyimagenet_resnet8_gn.csv",
         "default_dtype": torch.float32,
-        "default_data_root": "../tinyimagenet",
+        # kept for symmetry; we do NOT use a CLI flag for TinyImageNet anymore
+        "default_data_root": TINYIMAGENET_SHARED_ROOT,
         "sketched": {"seeds": [2, 3, 4, 5, 6]},
         "debias_sketched": True,
     },
 }
-
 
 # ------------------------------------------------------------------------
 # Logging helpers (loss)
@@ -274,7 +184,7 @@ def gn(num_channels: int, preferred_groups: int = 8) -> nn.GroupNorm:
 
 
 # ------------------------------------------------------------------------
-# ResNet-8 (CIFAR-style) with GroupNorm (Opacus-friendly)
+# ResNet-8 (CIFAR-style) with GroupNorm
 # ------------------------------------------------------------------------
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
@@ -301,6 +211,7 @@ class BasicBlockGN(nn.Module):
 
     def forward(self, x):
         identity = x
+
         out = self.conv1(x)
         out = self.gn1(out)
         out = self.relu(out)
@@ -317,6 +228,13 @@ class BasicBlockGN(nn.Module):
 
 
 class ResNet8GN(nn.Module):
+    """
+    CIFAR-style ResNet-8 with GroupNorm:
+      stem: 3x3 conv + GN
+      stages: [1,1,1] basic blocks with strides [1,2,2]
+      head: global avg pool + linear
+    """
+
     def __init__(self, num_classes: int = 10, width: int = 16, gn_groups: int = 8):
         super().__init__()
         self.in_planes = width
@@ -358,9 +276,6 @@ class ResNet8GN(nn.Module):
         x = self.fc(x)
         return x
 
-    def name(self):
-        return f"ResNet8GN_w{self.in_planes}_g{self.gn_groups}"
-
 
 # ------------------------------------------------------------------------
 # Training / eval
@@ -368,7 +283,6 @@ class ResNet8GN(nn.Module):
 
 def train_one_epoch(
     *,
-    args,
     model,
     device,
     train_loader,
@@ -437,6 +351,16 @@ def set_seed(seed: int):
 # Data loaders
 # ------------------------------------------------------------------------
 
+def _assert_tinyimagenet_shared_layout(root: str) -> None:
+    train_dir = os.path.join(root, "train")
+    val_dir = os.path.join(root, "val")
+    if not (os.path.isdir(train_dir) and os.path.isdir(val_dir)):
+        raise FileNotFoundError(
+            f"TinyImageNet shared dataset not found or incomplete at: {root}\n"
+            f"Expected: {train_dir} and {val_dir}"
+        )
+
+
 def build_dataloaders(args):
     ds = args.dataset.lower()
 
@@ -453,8 +377,10 @@ def build_dataloaders(args):
             transforms.ToTensor(),
             transforms.Normalize((MNIST_MEAN,) * 3, (MNIST_STD,) * 3),
         ])
-        train_dataset = datasets.MNIST(args.data_root, train=True, download=True, transform=train_transform)
-        test_dataset = datasets.MNIST(args.data_root, train=False, download=True, transform=test_transform)
+        train_dataset = datasets.MNIST(DATASET_CONFIG["mnist"]["default_data_root"], train=True, download=True,
+                                       transform=train_transform)
+        test_dataset = datasets.MNIST(DATASET_CONFIG["mnist"]["default_data_root"], train=False, download=True,
+                                      transform=test_transform)
 
     elif ds == "fashionmnist":
         train_transform = transforms.Compose([
@@ -469,8 +395,10 @@ def build_dataloaders(args):
             transforms.ToTensor(),
             transforms.Normalize((FASHION_MNIST_MEAN,) * 3, (FASHION_MNIST_STD,) * 3),
         ])
-        train_dataset = datasets.FashionMNIST(args.data_root, train=True, download=True, transform=train_transform)
-        test_dataset = datasets.FashionMNIST(args.data_root, train=False, download=True, transform=test_transform)
+        train_dataset = datasets.FashionMNIST(DATASET_CONFIG["fashionmnist"]["default_data_root"], train=True,
+                                             download=True, transform=train_transform)
+        test_dataset = datasets.FashionMNIST(DATASET_CONFIG["fashionmnist"]["default_data_root"], train=False,
+                                            download=True, transform=test_transform)
 
     elif ds == "cifar10":
         train_transform = transforms.Compose([
@@ -483,16 +411,15 @@ def build_dataloaders(args):
             transforms.ToTensor(),
             transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
         ])
-        train_dataset = datasets.CIFAR10(root=args.data_root, train=True, download=True, transform=train_transform)
-        test_dataset = datasets.CIFAR10(root=args.data_root, train=False, download=True, transform=test_transform)
+        train_dataset = datasets.CIFAR10(root=DATASET_CONFIG["cifar10"]["default_data_root"], train=True, download=True,
+                                         transform=train_transform)
+        test_dataset = datasets.CIFAR10(root=DATASET_CONFIG["cifar10"]["default_data_root"], train=False, download=True,
+                                        transform=test_transform)
 
     elif ds == "tinyimagenet":
-        ti_root = download_and_prepare_tinyimagenet(args.data_root)
-        train_dir = os.path.join(ti_root, "train")
-        val_dir = os.path.join(ti_root, "val")
-
-        val_out = os.path.join(ti_root, "val_images_by_class")
-        prepare_tinyimagenet_val(val_dir=val_dir, out_dir=val_out)
+        _assert_tinyimagenet_shared_layout(TINYIMAGENET_SHARED_ROOT)
+        train_dir = os.path.join(TINYIMAGENET_SHARED_ROOT, "train")
+        val_dir = os.path.join(TINYIMAGENET_SHARED_ROOT, "val")
 
         train_transform = transforms.Compose([
             transforms.RandomCrop(64, padding=4),
@@ -506,7 +433,7 @@ def build_dataloaders(args):
         ])
 
         train_dataset = datasets.ImageFolder(root=train_dir, transform=train_transform)
-        test_dataset = datasets.ImageFolder(root=val_out, transform=test_transform)
+        test_dataset = datasets.ImageFolder(root=val_dir, transform=test_transform)
 
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
@@ -535,13 +462,11 @@ def build_dataloaders(args):
 def run_experiments(args, device, train_loader, test_loader):
     ds = args.dataset.lower()
     cfg = DATASET_CONFIG[ds]
-
     num_classes = cfg["num_classes"]
 
     metrics_csv = args.csv_filename or cfg["default_csv"]
     loss_csv = cfg["default_loss_csv"]
     fractions_csv = cfg["default_fractions_csv"]
-
     metrics_exists = os.path.isfile(metrics_csv)
 
     seeds = cfg["sketched"]["seeds"]
@@ -579,7 +504,6 @@ def run_experiments(args, device, train_loader, test_loader):
                     seed=seed,
                 )
 
-                # Shared run metadata used in BOTH loss and fraction logs (and also in metrics rows)
                 run_meta = {
                     "dataset": ds,
                     "arch": arch_str,
@@ -593,7 +517,6 @@ def run_experiments(args, device, train_loader, test_loader):
                     "max_per_sample_grad_norm": float(args.max_per_sample_grad_norm),
                 }
 
-                # Inject optimizer-side logging config (fractions)
                 optimizer.set_logging(
                     fractions_csv_path=fractions_csv,
                     run_meta=run_meta,
@@ -618,7 +541,6 @@ def run_experiments(args, device, train_loader, test_loader):
 
                 for epoch in range(1, args.epochs + 1):
                     train_one_epoch(
-                        args=args,
                         model=model,
                         device=device,
                         train_loader=train_loader_p,
@@ -686,13 +608,12 @@ def main():
         help="Clip per-sample gradients to this norm",
     )
 
-    # Data / logging
-    parser.add_argument("--data-root", type=str, default="../data", help="Dataset root")
+    # Logging
     parser.add_argument("--csv-filename", type=str, default=None, help="Optional metrics CSV filename override")
 
     # ResNet knobs
     parser.add_argument("--resnet-width", type=int, default=16, help="Base width for ResNet-8 (channels)")
-    parser.add_argument("--gn-groups", type=int, default=8, help="Preferred GN groups")
+    parser.add_argument("--gn-groups", type=int, default=8, help="Preferred GN groups (auto-adjusted per layer)")
 
     # AdamCorr knobs
     parser.add_argument("--adamcorr-lr", type=float, default=1e-3, help="AdamCorr learning rate")
@@ -721,10 +642,6 @@ def main():
 
     cfg = DATASET_CONFIG[ds]
     torch.set_default_dtype(cfg["default_dtype"])
-
-    # If user keeps default "../data", use dataset-specific default root
-    if args.data_root == "../data":
-        args.data_root = cfg["default_data_root"]
 
     device = torch.device(args.device)
     train_loader, test_loader = build_dataloaders(args)
